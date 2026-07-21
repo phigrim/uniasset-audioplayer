@@ -3,6 +3,24 @@
 [unstable]
 build-std = ["std", "panic_abort"]
 
+[target.aarch64-linux-android]
+rustflags = [
+    "-C", "link-arg=-lc++_static",
+    "-C", "link-arg=-lc++abi"
+]
+
+[target.armv7-linux-androideabi]
+rustflags = [
+    "-C", "link-arg=-lc++_static",
+    "-C", "link-arg=-lc++abi"
+]
+
+[target.i686-linux-android]
+rustflags = ["-C", "link-arg=-static-libstdc++"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-static-libstdc++"]
+
 [target.aarch64-apple-ios]
 rustflags = [
     "-C",
