@@ -2,7 +2,7 @@ use std::{
     cell::UnsafeCell,
     io,
     sync::{
-        atomic::{AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     thread,
@@ -13,10 +13,30 @@ use parking_lot::{Condvar, Mutex};
 use super::BUFFER_WATERMARK;
 use crate::mixer::AudioStream;
 
-static WORKER_REF_COUNTER: AtomicI32 = AtomicI32::new(0);
-static WORKER_MUTEX: Mutex<()> = Mutex::new(());
+static WORKER_STATE: Mutex<WorkerState> = Mutex::new(WorkerState::new());
 static WORKER_CV: Condvar = Condvar::new();
 static BUFFER_GROUPS: Mutex<Vec<BufferGroup>> = Mutex::new(Vec::new());
+
+/// Lifecycle state for the single shared buffer-filling worker.
+///
+/// All transitions that create, reuse, or stop the worker happen while this
+/// mutex is held. This prevents a newly acquired handle from spawning another
+/// worker while a previous one is waking up to exit.
+struct WorkerState {
+    handle_count: usize,
+    running: bool,
+    work_pending: bool,
+}
+
+impl WorkerState {
+    const fn new() -> Self {
+        Self {
+            handle_count: 0,
+            running: false,
+            work_pending: false,
+        }
+    }
+}
 
 /// A lock-free single-producer single-consumer ring buffer for `f32` audio samples.
 ///
@@ -176,14 +196,11 @@ struct BufferGroup {
 pub struct WorkerHandle();
 
 impl WorkerHandle {
-    fn new() -> Self {
-        WORKER_REF_COUNTER.fetch_add(1, Ordering::Relaxed);
-        WorkerHandle()
-    }
-
     /// Wake the worker thread so it re-evaluates watermark levels.
     pub fn notify(&self) {
-        WORKER_CV.notify_all();
+        let mut state = WORKER_STATE.lock();
+        state.work_pending = true;
+        WORKER_CV.notify_one();
     }
 
     /// Register a stream/buffer pair for background filling.
@@ -202,18 +219,32 @@ impl WorkerHandle {
 
 impl Drop for WorkerHandle {
     fn drop(&mut self) {
-        WORKER_REF_COUNTER.fetch_sub(1, Ordering::Relaxed);
+        let mut state = WORKER_STATE.lock();
+        debug_assert!(state.handle_count > 0);
+        state.handle_count -= 1;
+        if state.handle_count == 0 {
+            WORKER_CV.notify_all();
+        }
     }
 }
 
 pub fn acquire_worker_handle() -> Result<WorkerHandle, io::Error> {
-    if WORKER_REF_COUNTER.load(Ordering::Relaxed) == 0 {
-        thread::Builder::new()
+    let mut state = WORKER_STATE.lock();
+    state.handle_count += 1;
+
+    if !state.running {
+        state.running = true;
+        if let Err(error) = thread::Builder::new()
             .name("buffered-stream-worker".to_owned())
-            .spawn(|| worker_thread())?;
+            .spawn(worker_thread)
+        {
+            state.handle_count -= 1;
+            state.running = false;
+            return Err(error);
+        }
     }
 
-    Ok(WorkerHandle::new())
+    Ok(WorkerHandle())
 }
 
 /// Background thread that keeps all registered ring buffers above the
@@ -222,15 +253,23 @@ fn worker_thread() {
     // Reusable temporary buffer for stream reads; grows on demand.
     let mut temp_buf: Vec<f32> = vec![0.0f32; 4096];
 
-    while WORKER_REF_COUNTER.load(Ordering::Relaxed) != 0 {
-        // Wait for a notification.
+    loop {
+        // Wait until there is new work, or terminate after the final handle
+        // has been released. The predicate prevents notifications from being
+        // lost between a fill pass and the next wait.
         {
-            let mut guard = WORKER_MUTEX.lock();
-            // Re-check inside the lock to avoid a missed wake-up.
-            if WORKER_REF_COUNTER.load(Ordering::Relaxed) == 0 {
+            let mut state = WORKER_STATE.lock();
+            while state.handle_count != 0 && !state.work_pending {
+                WORKER_CV.wait(&mut state);
+            }
+
+            if state.handle_count == 0 {
+                state.running = false;
+                state.work_pending = false;
                 return;
             }
-            WORKER_CV.wait(&mut guard);
+
+            state.work_pending = false;
         }
 
         // Keep filling until every buffer is above the watermark or dry.
