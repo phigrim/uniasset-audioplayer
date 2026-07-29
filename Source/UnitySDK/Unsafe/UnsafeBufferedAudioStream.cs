@@ -16,16 +16,13 @@ namespace Uniasset.AudioPlayer.Unsafe
     public static unsafe class UnsafeBufferedAudioStream
     {
         /// <summary>
-        /// Wrap a native audio stream handle in a buffered stream.
-        /// <paramref name="innerHandle"/> is not consumed — the caller
-        /// remains responsible for destroying it.
+        /// Wrap a native audio stream handle in a buffered stream with the
+        /// requested buffer duration.
         /// </summary>
-        /// <exception cref="NativeException">
-        /// Thrown if the native buffered stream could not be created.
-        /// </exception>
-        public static UnsafeInternalAudioStream Create(void* innerHandle)
+        public static UnsafeInternalAudioStream Create(void* innerHandle, TimeSpan bufferDuration)
         {
-            var handle = Interop.UAP_BufferedAudioStream_Create(innerHandle);
+            var handle = Interop.UAP_BufferedAudioStream_Create(
+                innerHandle, ToMilliseconds(bufferDuration));
             NativeException.ThrowIfNeeded();
             if (handle == null)
                 throw new NativeException(
@@ -34,23 +31,34 @@ namespace Uniasset.AudioPlayer.Unsafe
         }
 
         /// <summary>
-        /// Wrap a native audio stream (callbacks struct) in a buffered stream.
-        /// <paramref name="stream"/> is copied — the caller retains ownership.
+        /// Wrap a native audio stream in a buffered stream with the requested
+        /// buffer duration.
         /// </summary>
-        /// <exception cref="NativeException">
-        /// Thrown if the native buffered stream could not be created.
-        /// </exception>
-        public static unsafe UnsafeInternalAudioStream CreateFromNative(ref NativeAudioStream stream)
+        public static UnsafeInternalAudioStream CreateFromNative(
+            ref NativeAudioStream stream,
+            TimeSpan bufferDuration)
         {
             fixed (NativeAudioStream* streamPtr = &stream)
             {
-                var handle = Interop.UAP_BufferedAudioStream_CreateFromNative(streamPtr);
+                var handle = Interop.UAP_BufferedAudioStream_CreateFromNative(
+                    streamPtr, ToMilliseconds(bufferDuration));
                 NativeException.ThrowIfNeeded();
                 if (handle == null)
                     throw new NativeException(
                         "Failed to create BufferedAudioStream: native returned null");
                 return new UnsafeInternalAudioStream(handle);
             }
+        }
+
+        private static uint ToMilliseconds(TimeSpan duration)
+        {
+            if (duration <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(duration),
+                    "Buffer duration must be positive.");
+            if (duration.TotalMilliseconds > uint.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(duration),
+                    "Buffer duration is too large.");
+            return checked((uint)Math.Ceiling(duration.TotalMilliseconds));
         }
     }
 }

@@ -1,3 +1,4 @@
+using System;
 using Uniasset.AudioPlayer.Unsafe;
 
 namespace Uniasset.AudioPlayer
@@ -15,6 +16,9 @@ namespace Uniasset.AudioPlayer
     /// </remarks>
     public sealed class BufferedAudioStream : InternalAudioStream
     {
+        /// <summary>Default amount of audio retained by a buffered stream.</summary>
+        public static readonly TimeSpan DefaultBufferDuration = TimeSpan.FromSeconds(12);
+
         private StreamBinding? _innerBinding;
 
         /// <summary>
@@ -23,22 +27,27 @@ namespace Uniasset.AudioPlayer
         /// <param name="stream">
         /// The audio stream to buffer. Must not be null.
         /// </param>
+        /// <param name="bufferDuration">
+        /// Amount of audio retained by the native buffer. Defaults to 12 seconds.
+        /// </param>
         /// <exception cref="NativeException">
         /// Thrown if the native buffered stream could not be created.
         /// </exception>
-        public unsafe BufferedAudioStream(IAudioStream stream)
+        public unsafe BufferedAudioStream(IAudioStream stream, TimeSpan? bufferDuration = null)
         {
+            var duration = bufferDuration ?? DefaultBufferDuration;
             if (stream is InternalAudioStream internalStream)
             {
                 // Fast path: use the existing native handle.
                 SetHandle(UnsafeBufferedAudioStream.Create(
-                    internalStream.UnsafeHandle.Instance));
+                    internalStream.UnsafeHandle.Instance, duration));
             }
             else
             {
                 // Fallback: create a NativeAudioStream callback bridge.
                 var binding = AudioStreamFactory.CreateBinding(stream);
-                SetHandle(UnsafeBufferedAudioStream.CreateFromNative(ref binding.NativeStream));
+                SetHandle(UnsafeBufferedAudioStream.CreateFromNative(
+                    ref binding.NativeStream, duration));
                 // Keep the binding alive — the native side copied the struct,
                 // but the GCHandle must remain for the callbacks to work.
                 _innerBinding = binding;

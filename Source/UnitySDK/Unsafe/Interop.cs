@@ -96,7 +96,7 @@ namespace Uniasset.AudioPlayer.Unsafe
         public static extern uint UAP_AudioPlayer_StreamCount(void* handle);
 
         // ==================================================================
-        // Buffered Stream (1 function)
+        // Buffered Stream (2 functions)
         // ==================================================================
 
         /// <summary>
@@ -107,7 +107,9 @@ namespace Uniasset.AudioPlayer.Unsafe
         /// Destroy the returned handle with <see cref="UAP_InternalAudioStream_Destroy"/>.
         /// </summary>
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern void* UAP_BufferedAudioStream_Create(void* stream);
+        public static extern void* UAP_BufferedAudioStream_Create(
+            void* stream,
+            [NativeTypeName("uint32_t")] uint bufferDurationMs);
 
         /// <summary>
         /// Wrap a native audio stream (callbacks struct) in a buffered stream.
@@ -117,7 +119,8 @@ namespace Uniasset.AudioPlayer.Unsafe
         /// </summary>
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void* UAP_BufferedAudioStream_CreateFromNative(
-            [NativeTypeName("const NativeAudioStream *")] NativeAudioStream* stream);
+            [NativeTypeName("const NativeAudioStream *")] NativeAudioStream* stream,
+            [NativeTypeName("uint32_t")] uint bufferDurationMs);
 
         // ==================================================================
         // Internal Audio Stream (6 functions)
