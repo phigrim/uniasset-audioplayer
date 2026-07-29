@@ -41,8 +41,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::error::AudioError;
-use crate::hal::AudioCallback;
-use crate::hal::AudioDevice;
+use crate::hal::{AudioDevice, AudioManager};
 use crate::types::AudioFormat;
 
 use super::com::ensure_com_initialized;
@@ -106,8 +105,6 @@ struct DeviceInner {
 // ── Commands ──────────────────────────────────────────────────────────────
 
 enum Command {
-    /// Start playback with a given callback.
-    Start(Box<dyn AudioCallback>),
     /// Stop playback and terminate the audio thread.
     Stop,
     /// Pause (IAudioClient::Stop + skip buffer fills).
@@ -213,9 +210,9 @@ impl WasapiClient {
     ///
     /// Returns `Ok(())` on success, `Err(())` on device error
     /// (caller should trigger endpoint rebuild).
-    fn fill_buffer(
+    fn fill_buffer<M: AudioManager>(
         &self,
-        callback: &dyn AudioCallback,
+        manager: &M,
         channels: u16,
         temp_buf: &mut Vec<f32>,
     ) -> Result<(), ()> {
@@ -237,8 +234,8 @@ impl WasapiClient {
             temp_buf.set_len(required);
         }
 
-        // Pull from callback.
-        let frames_written = callback.pull(&mut temp_buf[..required]);
+        // Pull from manager.
+        let frames_written = manager.pull(&mut temp_buf[..required]);
         // Clamp: buggy callbacks may return more frames than requested.
         let frames_written = frames_written.min(frames_available as usize);
 
@@ -293,10 +290,14 @@ fn try_build_client(client: &mut Option<WasapiClient>, format: &mut AudioFormat)
     }
 }
 
-fn run_audio_thread(inner: Arc<DeviceInner>, cmd_rx: mpsc::Receiver<Command>, cmd_event: HANDLE) {
+fn run_audio_thread<M: AudioManager>(
+    inner: Arc<DeviceInner>,
+    cmd_rx: mpsc::Receiver<Command>,
+    cmd_event: HANDLE,
+    manager: M,
+) {
     ensure_com_initialized();
 
-    let mut callback: Option<Box<dyn AudioCallback>> = None;
     let mut client: Option<WasapiClient> = None;
     let mut temp_buf: Vec<f32> = Vec::new();
     let mut current_format = inner.format.read().clone();
@@ -306,7 +307,6 @@ fn run_audio_thread(inner: Arc<DeviceInner>, cmd_rx: mpsc::Receiver<Command>, cm
         // ── Drain commands ───────────────────────────────────────────
         drain_commands(
             &cmd_rx,
-            &mut callback,
             &mut client,
             &mut current_format,
             &inner,
@@ -325,6 +325,8 @@ fn run_audio_thread(inner: Arc<DeviceInner>, cmd_rx: mpsc::Receiver<Command>, cm
 
         // ── Device switch ────────────────────────────────────────────
         if inner.device_changed.swap(false, Ordering::Acquire) {
+            manager.on_device_invalidated();
+
             if let Some(ref c) = client {
                 let _ = c.stop();
             }
@@ -333,11 +335,14 @@ fn run_audio_thread(inner: Arc<DeviceInner>, cmd_rx: mpsc::Receiver<Command>, cm
             try_build_client(&mut client, &mut current_format);
             if let Some(ref c) = client {
                 *inner.format.write() = current_format;
+                manager.on_device_format_changed(current_format);
+
                 let running = inner.running.load(Ordering::Acquire);
                 let paused = inner.paused.load(Ordering::Acquire);
                 if running && !paused {
                     let _ = c.start();
                 }
+                manager.on_device_recovered();
             }
         }
 
@@ -353,12 +358,10 @@ fn run_audio_thread(inner: Arc<DeviceInner>, cmd_rx: mpsc::Receiver<Command>, cm
                     let result = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
 
                     if result == WAIT_OBJECT_0 {
-                        if let Some(ref cb) = callback {
-                            if c.fill_buffer(cb.as_ref(), current_format.channels, &mut temp_buf)
-                                .is_err()
-                            {
-                                inner.device_changed.store(true, Ordering::Release);
-                            }
+                        if c.fill_buffer(&manager, current_format.channels, &mut temp_buf)
+                            .is_err()
+                        {
+                            inner.device_changed.store(true, Ordering::Release);
                         }
                     }
                     // WAIT_OBJECT_0 + 1: cmd_event → loop to drain.
@@ -381,7 +384,6 @@ fn run_audio_thread(inner: Arc<DeviceInner>, cmd_rx: mpsc::Receiver<Command>, cm
                 Ok(cmd) => {
                     handle_single_command(
                         cmd,
-                        &mut callback,
                         &mut client,
                         &mut current_format,
                         &inner,
@@ -407,7 +409,6 @@ fn run_audio_thread(inner: Arc<DeviceInner>, cmd_rx: mpsc::Receiver<Command>, cm
 /// Process all pending commands from the channel.
 fn drain_commands(
     rx: &mpsc::Receiver<Command>,
-    callback: &mut Option<Box<dyn AudioCallback>>,
     client: &mut Option<WasapiClient>,
     format: &mut AudioFormat,
     inner: &DeviceInner,
@@ -415,7 +416,7 @@ fn drain_commands(
 ) {
     loop {
         match rx.try_recv() {
-            Ok(cmd) => handle_single_command(cmd, callback, client, format, inner, should_exit),
+            Ok(cmd) => handle_single_command(cmd, client, format, inner, should_exit),
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
                 *should_exit = true;
@@ -428,26 +429,12 @@ fn drain_commands(
 /// Process one command.
 fn handle_single_command(
     cmd: Command,
-    callback: &mut Option<Box<dyn AudioCallback>>,
     client: &mut Option<WasapiClient>,
     format: &mut AudioFormat,
     inner: &DeviceInner,
     should_exit: &mut bool,
 ) {
     match cmd {
-        Command::Start(cb) => {
-            *callback = Some(cb);
-            if client.is_none() {
-                try_build_client(client, format);
-                if client.is_some() {
-                    *inner.format.write() = *format;
-                }
-            }
-            if let Some(ref c) = client {
-                let _ = c.start();
-            }
-            inner.running.store(true, Ordering::Release);
-        }
         Command::Stop => {
             inner.running.store(false, Ordering::Release);
             inner.paused.store(false, Ordering::Release);
@@ -481,8 +468,9 @@ fn handle_single_command(
 /// tears down the old endpoint and rebuilds on the current default
 /// device. If the previous device is no longer available, the thread
 /// retries until a new endpoint is found.
-pub struct WasapiDevice {
+pub struct WasapiDevice<M: AudioManager> {
     inner: Arc<DeviceInner>,
+    manager: Option<M>,
 
     /// Command sender. `None` after the audio thread stops.
     cmd_tx: Option<mpsc::Sender<Command>>,
@@ -500,7 +488,7 @@ pub struct WasapiDevice {
 
 // Safety: COM in MTA; audio-thread resources transferred via
 // raw pointers inside WasapiThreadContext.
-unsafe impl Send for WasapiDevice {}
+unsafe impl<M: AudioManager> Send for WasapiDevice<M> {}
 
 // ── Thread context (Send-safe bundle) ─────────────────────────────────────
 
@@ -512,13 +500,13 @@ struct WasapiThreadContext {
 
 unsafe impl Send for WasapiThreadContext {}
 
-impl WasapiDevice {
+impl<M: AudioManager> WasapiDevice<M> {
     /// Create a new WASAPI device.
     ///
     /// Queries the initial hardware format and prepares the command
     /// channel. The audio thread is **not** started yet — call
     /// [`start`](AudioDevice::start) to begin playback.
-    pub fn new() -> Result<Self, AudioError> {
+    pub fn new(manager: M) -> Result<Self, AudioError> {
         ensure_com_initialized();
 
         // ── Query initial format ──────────────────────────────────────
@@ -551,6 +539,7 @@ impl WasapiDevice {
 
         Ok(Self {
             inner,
+            manager: Some(manager),
             cmd_tx: Some(cmd_tx),
             cmd_rx: Some(cmd_rx),
             cmd_event,
@@ -561,12 +550,12 @@ impl WasapiDevice {
 
 // ── AudioDevice impl ──────────────────────────────────────────────────────
 
-impl AudioDevice for WasapiDevice {
+impl<M: AudioManager> AudioDevice for WasapiDevice<M> {
     fn format(&self) -> AudioFormat {
         self.inner.format.read().clone()
     }
 
-    fn start(&mut self, callback: Box<dyn AudioCallback>) -> Result<(), AudioError> {
+    fn start(&mut self) -> Result<(), AudioError> {
         // Already running?
         if self.thread.is_some() {
             return Ok(());
@@ -581,6 +570,10 @@ impl AudioDevice for WasapiDevice {
             .cmd_rx
             .take()
             .ok_or_else(|| wasapi_err("device already started"))?;
+        let manager = self
+            .manager
+            .take()
+            .ok_or_else(|| wasapi_err("device manager already started"))?;
 
         let cmd_event = self.cmd_event;
         let cmd_event_ptr = cmd_event.0 as usize;
@@ -592,12 +585,6 @@ impl AudioDevice for WasapiDevice {
             cmd_event_ptr,
         };
 
-        // Send the Start command.
-        cmd_tx
-            .send(Command::Start(callback))
-            .map_err(|_| wasapi_err("audio thread gone"))?;
-        let _ = unsafe { SetEvent(cmd_event) };
-
         // Spawn the audio thread.
         let handle = thread::Builder::new()
             .name("uniasset-wasapi".into())
@@ -608,7 +595,7 @@ impl AudioDevice for WasapiDevice {
                     cmd_event_ptr,
                 } = ctx;
                 let cmd_event = HANDLE(cmd_event_ptr as *mut std::ffi::c_void);
-                run_audio_thread(inner, cmd_rx, cmd_event);
+                run_audio_thread(inner, cmd_rx, cmd_event, manager);
                 // Let cmd_rx, HANDLE drop here; COM objects dropped in run_audio_thread.
             })
             .map_err(|e| wasapi_err(e))?;
@@ -616,6 +603,7 @@ impl AudioDevice for WasapiDevice {
         // Store the sender back for subsequent control calls.
         self.cmd_tx = Some(cmd_tx);
         self.thread = Some(handle);
+        self.inner.running.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -653,7 +641,7 @@ impl AudioDevice for WasapiDevice {
 
 // ── Drop ──────────────────────────────────────────────────────────────────
 
-impl Drop for WasapiDevice {
+impl<M: AudioManager> Drop for WasapiDevice<M> {
     fn drop(&mut self) {
         // 1. Stop the audio thread.
         if let Some(ref tx) = self.cmd_tx {

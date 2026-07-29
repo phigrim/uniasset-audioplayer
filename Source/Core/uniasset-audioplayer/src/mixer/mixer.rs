@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 
-use crate::hal::AudioCallback;
+use crate::hal::AudioManager;
 use crate::mixer::{AudioStream, PlayHandle, StreamState};
 use crate::AudioFormat;
 
@@ -17,6 +17,8 @@ struct MixerEntry {
 
 /// A frozen snapshot of all streams for lock-free audio thread access.
 struct MixerSnapshot {
+    /// Output format and derived resampling ratios are published together.
+    format: AudioFormat,
     entries: Vec<SnapshotEntry>,
 }
 
@@ -50,7 +52,7 @@ struct ScratchBuf {
 /// A lock-free audio mixer that combines multiple [`AudioStream`]s into
 /// a single output.
 ///
-/// The mixer implements [`AudioCallback`] so it can be passed directly to
+/// The mixer implements [`AudioManager`] so it can be passed directly to
 /// [`AudioDevice::start`](crate::hal::AudioDevice::start).
 ///
 /// # Example
@@ -64,9 +66,6 @@ struct ScratchBuf {
 /// handle.set_volume(0.5);
 /// ```
 pub struct Mixer {
-    /// Target output format (usually matches hardware).
-    format: AudioFormat,
-
     /// Current read-only snapshot, atomically swapped via `ArcSwap`.
     /// `load()` returns a temporary `Arc` that keeps the snapshot alive
     /// for the duration of the audio callback — no unsafe, no deferred-free.
@@ -77,13 +76,17 @@ pub struct Mixer {
     /// and only during add/remove/cleanup).
     entries: Mutex<Vec<MixerEntry>>,
 
+    /// Serializes snapshot publication from control and device-maintenance
+    /// threads. The audio callback never takes this lock.
+    snapshot_update: Mutex<()>,
+
     /// Scratch buffers for the audio thread.
     /// Wrapped in `UnsafeCell` — only the audio thread accesses this.
     /// Pre-allocated capacity removes allocation from the hot path.
     scratch: UnsafeCell<ScratchBuf>,
 }
 
-// Safety: Mixer requires Send + Sync for AudioCallback.
+// Safety: Mixer requires Send + Sync for AudioManager.
 // All mutable state is behind atomics, ArcSwap, UnsafeCell
 // (single-thread access), or Mutex (control-thread-only).
 unsafe impl Send for Mixer {}
@@ -106,11 +109,12 @@ impl Mixer {
         let mix_buf = Vec::with_capacity(4096);
 
         Self {
-            format,
             snapshot: ArcSwap::new(Arc::new(MixerSnapshot {
+                format,
                 entries: Vec::new(),
             })),
             entries: Mutex::new(Vec::new()),
+            snapshot_update: Mutex::new(()),
             scratch: UnsafeCell::new(ScratchBuf {
                 stream_buf,
                 mix_buf,
@@ -120,7 +124,19 @@ impl Mixer {
 
     /// Return the target audio format.
     pub fn format(&self) -> AudioFormat {
-        self.format
+        self.snapshot.load().format
+    }
+
+    /// Update the target format after the HAL has stopped the old endpoint.
+    ///
+    /// Rebuilding the snapshot updates each stream's resampling ratio before
+    /// playback resumes on the replacement endpoint.
+    fn reconfigure_format(&self, format: AudioFormat) {
+        let _update = self.snapshot_update.lock();
+        if self.snapshot.load().format == format {
+            return;
+        }
+        self.publish_snapshot(format);
     }
 
     /// Number of streams currently in the mixer.
@@ -175,7 +191,16 @@ impl Mixer {
     /// via `ArcSwap::store`. The old snapshot is retained as long as any
     /// in-flight audio callback holds a reference via `load()`.
     fn rebuild_snapshot(&self) {
-        let mixer_rate = self.format.sample_rate as f64;
+        let _update = self.snapshot_update.lock();
+        let format = self.snapshot.load().format;
+        self.publish_snapshot(format);
+    }
+
+    /// Build and publish a complete format + stream snapshot. The caller
+    /// holds `snapshot_update`, so concurrent control operations cannot
+    /// publish an older format after a device reconfiguration.
+    fn publish_snapshot(&self, format: AudioFormat) {
+        let mixer_rate = format.sample_rate as f64;
 
         // Carry forward resample positions from the current snapshot so
         // existing streams don't reset to 0 on every rebuild.
@@ -211,21 +236,21 @@ impl Mixer {
         };
 
         self.snapshot.store(Arc::new(MixerSnapshot {
+            format,
             entries: new_entries,
         }));
     }
 }
 
-impl AudioCallback for Mixer {
+impl AudioManager for Mixer {
     fn pull(&self, buffer: &mut [f32]) -> usize {
-        let mixer_channels = self.format.channels as usize;
+        // ── Load snapshot (lock-free, memory-safe via ArcSwap) ──────────
+        let snapshot = self.snapshot.load();
+        let mixer_channels = snapshot.format.channels as usize;
         let frame_count = buffer.len() / mixer_channels;
 
         // Zero the output — we'll add (mix) into it.
         buffer.fill(0.0);
-
-        // ── Load snapshot (lock-free, memory-safe via ArcSwap) ──────────
-        let snapshot = self.snapshot.load();
 
         if snapshot.entries.is_empty() {
             return frame_count;
@@ -343,6 +368,10 @@ impl AudioCallback for Mixer {
 
         frame_count
     }
+
+    fn on_device_format_changed(&self, format: AudioFormat) {
+        self.reconfigure_format(format);
+    }
 }
 
 /// Fast path: no resampling, no channel conversion. Just apply volume
@@ -405,5 +434,86 @@ fn mix_resampled(
 
             dst[out_offset + ch] += sample * volume;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::Mixer;
+    use crate::hal::AudioManager;
+    use crate::mixer::AudioStream;
+    use crate::{AudioError, AudioFormat};
+
+    struct TestStream {
+        sample_rate: u32,
+    }
+
+    impl AudioStream for TestStream {
+        fn read(&self, buffer: &mut [f32], _frame_count: u64) -> usize {
+            buffer.fill(0.0);
+            buffer.len()
+        }
+
+        fn seek(&self, _frame: u64) -> Result<(), AudioError> {
+            Ok(())
+        }
+
+        fn is_eof(&self) -> bool {
+            false
+        }
+
+        fn channels(&self) -> u16 {
+            2
+        }
+
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+    }
+
+    #[test]
+    fn format_and_resample_ratio_publish_together() {
+        let mixer = Mixer::new(48_000, 2);
+        mixer.add_stream(
+            Arc::new(TestStream {
+                sample_rate: 48_000,
+            }),
+            true,
+        );
+
+        mixer.on_device_format_changed(AudioFormat::new(44_100, 2));
+
+        let snapshot = mixer.snapshot.load();
+        assert_eq!(snapshot.format, AudioFormat::new(44_100, 2));
+        assert_eq!(snapshot.entries.len(), 1);
+        assert!((snapshot.entries[0].ratio - (48_000.0 / 44_100.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn format_reconfiguration_preserves_stream_position() {
+        let mixer = Mixer::new(48_000, 2);
+        mixer.add_stream(
+            Arc::new(TestStream {
+                sample_rate: 48_000,
+            }),
+            true,
+        );
+
+        mixer.snapshot.load().entries[0]
+            .position
+            .store(123.5_f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        mixer.on_device_format_changed(AudioFormat::new(44_100, 2));
+
+        let snapshot = mixer.snapshot.load();
+        assert_eq!(
+            f64::from_bits(
+                snapshot.entries[0]
+                    .position
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            ),
+            123.5
+        );
     }
 }

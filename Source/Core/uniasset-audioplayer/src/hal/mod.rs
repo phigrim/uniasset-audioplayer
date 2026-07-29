@@ -1,12 +1,12 @@
 //! Hardware Abstraction Layer for cross-platform audio output.
 //!
-//! This module defines the [`AudioCallback`] and [`AudioDevice`] traits that
+//! This module defines the [`AudioManager`] and [`AudioDevice`] traits that
 //! abstract over platform-specific audio APIs (CoreAudio, WASAPI, Oboe).
 //!
 //! # Pull Model
 //!
 //! The audio device "pulls" PCM samples from the application via the
-//! [`AudioCallback::pull`] method whenever the OS audio subsystem needs
+//! [`AudioManager::pull`] method whenever the OS audio subsystem needs
 //! data to fill its output buffer. The callback should produce samples
 //! directly on the audio thread — no intermediate buffering is mandated
 //! by the HAL.
@@ -27,9 +27,11 @@
 //! of `format().channels`.
 
 mod device;
+mod manager;
 pub mod platform;
 use crate::error::AudioError;
 pub use device::*;
+pub use manager::*;
 
 /// Open the default audio output device.
 ///
@@ -44,6 +46,9 @@ pub use device::*;
 /// | Windows    | WASAPI    |
 /// | Android    | Oboe      |
 /// | Other      | Dummy     |
-pub fn open_device() -> Result<Box<dyn AudioDevice>, AudioError> {
-    platform::create_device()
+pub fn open_device<M>(manager: M) -> Result<platform::PlatformAudioDevice<M>, AudioError>
+where
+    M: AudioManager,
+{
+    platform::PlatformAudioDevice::new(manager)
 }

@@ -4,7 +4,7 @@
 //! # Architecture
 //!
 //! ```text
-//! AudioStream(s) → Mixer → AudioCallback → AudioDevice → OS Audio
+//! AudioStream(s) → Mixer → AudioManager → AudioDevice → OS Audio
 //!                    ↑                        ↑
 //!              [audio-player-worker]     AudioPlayer (owns both,
 //!              (periodic EOF cleanup)     wires them together)
@@ -32,24 +32,11 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use crate::hal::{open_device, AudioCallback, AudioDevice};
+use crate::hal::platform::PlatformAudioDevice;
+use crate::hal::{open_device, AudioDevice, AudioManager};
 use crate::mixer::{AudioStream, Mixer, PlayHandle};
 use crate::AudioError;
 use crate::AudioFormat;
-
-/// Thin wrapper that delegates [`AudioCallback::pull`] to an [`Arc<Mixer>`].
-///
-/// The mixer is shared with [`AudioPlayer`] so streams can be added/removed
-/// while the audio device is running.
-struct MixerCallback {
-    mixer: Arc<Mixer>,
-}
-
-impl AudioCallback for MixerCallback {
-    fn pull(&self, buffer: &mut [f32]) -> usize {
-        self.mixer.pull(buffer)
-    }
-}
 
 /// A high-level audio player that combines platform audio output ([`AudioDevice`])
 /// with lock-free mixing ([`Mixer`]).
@@ -80,8 +67,7 @@ pub struct AudioPlayer {
 
     /// The platform audio device. Behind a mutex because `start`/`stop`/
     /// `pause`/`resume` take `&mut self`.
-    device: Mutex<Box<dyn AudioDevice>>,
-
+    device: Mutex<PlatformAudioDevice<Arc<Mixer>>>,
     /// Signal to the worker thread that it should exit.
     shutdown: Arc<AtomicBool>,
 
@@ -99,15 +85,12 @@ impl AudioPlayer {
     /// Returns an error if no output device is available or if the device
     /// cannot be started.
     pub fn new() -> Result<Self, AudioError> {
-        let mut device = open_device()?;
+        // The device's initial format is known before it starts invoking pull.
+        let mixer = Arc::new(Mixer::new(48_000, 2));
+        let mut device = open_device(Arc::clone(&mixer))?;
         let format = device.format();
-
-        let mixer = Arc::new(Mixer::new(format.sample_rate, format.channels));
-
-        let callback = Box::new(MixerCallback {
-            mixer: Arc::clone(&mixer),
-        });
-        device.start(callback)?;
+        mixer.on_device_format_changed(format);
+        device.start()?;
 
         // ── Worker thread for periodic EOF cleanup ────────────────────────
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -122,7 +105,8 @@ impl AudioPlayer {
                 while !worker_shutdown.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(10));
                     ticks += 1;
-                    if ticks % 50 == 0 {
+
+                    if ticks.is_multiple_of(50) {
                         // ~500ms elapsed
                         worker_mixer.cleanup_eof();
                     }

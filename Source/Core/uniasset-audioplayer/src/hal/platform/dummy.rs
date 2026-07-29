@@ -1,6 +1,6 @@
 //! Dummy audio device for unsupported platforms.
 //!
-//! This device accepts a callback and calls `pull()` in a dedicated thread
+//! This device accepts a manager and calls `pull()` in a dedicated thread
 //! at approximately the requested sample rate, discarding the output. It
 //! is useful for testing the pipeline on platforms without a real audio
 //! backend.
@@ -10,8 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::AudioError;
-use crate::hal::AudioCallback;
-use crate::hal::AudioDevice;
+use crate::hal::{AudioDevice, AudioManager};
 use crate::types::AudioFormat;
 
 /// Default format for the dummy device: 48 kHz stereo.
@@ -21,20 +20,22 @@ const DEFAULT_FORMAT: AudioFormat = AudioFormat::new(48000, 2);
 const PULL_INTERVAL_MS: u64 = 10;
 
 /// A no-op audio device that pulls samples on a timer thread.
-pub struct DummyDevice {
+pub struct DummyDevice<M: AudioManager> {
     format: AudioFormat,
+    manager: Option<M>,
     stop_tx: Option<mpsc::Sender<()>>,
     thread_handle: Option<thread::JoinHandle<()>>,
     running: bool,
 }
 
-unsafe impl Send for DummyDevice {}
+unsafe impl<M: AudioManager> Send for DummyDevice<M> {}
 
-impl DummyDevice {
+impl<M: AudioManager> DummyDevice<M> {
     /// Create a new dummy device.
-    pub fn new() -> Self {
+    pub fn new(manager: M) -> Self {
         Self {
             format: DEFAULT_FORMAT,
+            manager: Some(manager),
             stop_tx: None,
             thread_handle: None,
             running: false,
@@ -42,15 +43,19 @@ impl DummyDevice {
     }
 }
 
-impl AudioDevice for DummyDevice {
+impl<M: AudioManager> AudioDevice for DummyDevice<M> {
     fn format(&self) -> AudioFormat {
         self.format
     }
-    fn start(&mut self, callback: Box<dyn AudioCallback>) -> Result<(), AudioError> {
+    fn start(&mut self) -> Result<(), AudioError> {
         if self.running {
             return Ok(());
         }
 
+        let manager = self
+            .manager
+            .take()
+            .ok_or_else(|| AudioError::BackendError("dummy manager already started".into()))?;
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let format = self.format;
         let interval = Duration::from_millis(PULL_INTERVAL_MS);
@@ -71,8 +76,8 @@ impl AudioDevice for DummyDevice {
                         break;
                     }
 
-                    // Pull samples from the callback (&self — lock-free).
-                    callback.pull(&mut buf);
+                    // Pull samples from the manager (&self — lock-free).
+                    manager.pull(&mut buf);
 
                     // Sleep to maintain the target pull rate.
                     next_tick += interval;
@@ -116,7 +121,7 @@ impl AudioDevice for DummyDevice {
     }
 }
 
-impl Drop for DummyDevice {
+impl<M: AudioManager> Drop for DummyDevice<M> {
     fn drop(&mut self) {
         let _ = self.stop();
     }
