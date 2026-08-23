@@ -1,4 +1,11 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use parking_lot::Mutex;
 
@@ -22,6 +29,9 @@ pub struct BufferedAudioStream {
     buffer: Arc<AudioBuffer>,
     /// Serializes control-thread seeks with the worker's non-real-time reads.
     io_gate: Arc<Mutex<()>>,
+    /// Seek 基准帧：`consumed_frames()` = 本值 + ring buffer 已消费样本/声道数。
+    /// seek 时更新为本值 + 目标帧，使位置查询跨 seek 连续（游戏音画同步用）。
+    consumed_base_frames: AtomicU64,
 }
 
 impl BufferedAudioStream {
@@ -40,7 +50,18 @@ impl BufferedAudioStream {
             worker_handle,
             buffer,
             io_gate,
+            consumed_base_frames: AtomicU64::new(0),
         })
+    }
+
+    /// 实际已被音频硬件消费的帧数（含欠载停顿——欠载时该值不推进）。
+    ///
+    /// 谱面时间基准用此值而非墙钟，可保证音画同步不因渲染卡顿漂移：
+    /// 音乐丢样本时谱面随之等待而非继续跑。
+    pub fn consumed_frames(&self) -> u64 {
+        let channels = self.inner.channels().max(1) as u64;
+        self.consumed_base_frames.load(Ordering::Acquire)
+            + self.buffer.total_consumed_samples() / channels
     }
 }
 
@@ -146,6 +167,15 @@ impl AudioStream for BufferedAudioStream {
             self.inner.seek(frame)?;
             self.buffer.discard_buffered_samples();
         }
+        // 位置查询基准跳到目标帧：consumed_frames() = base + 已消费样本/声道数。
+        // ⚠️ 绝不能重置 ring buffer 的 read_ptr——它是音频线程的消费游标，
+        // 归零会让下一次 read 从环形缓冲最老数据处重新消费（回放旧样本）且
+        // 与 write_ptr/discard_before 体系错位，直接破坏播放。位置连续性由
+        // base 单独承载。
+        self.consumed_base_frames.store(
+            frame.wrapping_sub(self.buffer.total_consumed_samples() / self.inner.channels().max(1) as u64),
+            Ordering::Release,
+        );
         self.worker_handle.notify();
         Ok(())
     }

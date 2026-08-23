@@ -100,6 +100,17 @@ impl AudioBuffer {
         self.available() as f32 / self.capacity as f32
     }
 
+    /// Total samples consumed since creation (`read_ptr` is monotonic).
+    ///
+    /// Note: a seek does not reset this counter — callers combine it with
+    /// their own seek base to obtain an absolute stream position.
+    #[inline]
+    pub fn total_consumed_samples(&self) -> u64 {
+        let read = self.read_ptr.load(Ordering::Relaxed);
+        let discard = self.discard_before.load(Ordering::Acquire);
+        read.max(discard)
+    }
+
     /// Write samples into the ring buffer (producer side — worker thread).
     ///
     /// Returns the number of samples actually written (may be less than
