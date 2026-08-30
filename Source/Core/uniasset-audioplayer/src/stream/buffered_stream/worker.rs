@@ -78,10 +78,19 @@ impl AudioBuffer {
     ///
     /// Safe to call from any thread but the result is a snapshot — the other
     /// side may advance between the call and the next operation.
+    ///
+    /// ⚠️ 有效读游标 = max(read_ptr, discard_before)，与 `read()` 保持一致：
+    /// seek 的 discard 请求只前移 discard_before、不动 read_ptr，若此处仍用裸
+    /// read_ptr，seek 后可用量仍显示为旧缓冲水位 → worker 的 free_space ≈ 0
+    /// 不再填充，而消费端已从 discard_before 位置读取（读不到数据），
+    /// 缓冲永久"满但不可读"（等待期预填时 seek 必现，画面/音乐冻结）。
     #[inline]
     pub fn available(&self) -> usize {
         let write = self.write_ptr.load(Ordering::Acquire);
-        let read = self.read_ptr.load(Ordering::Relaxed);
+        let read = self
+            .read_ptr
+            .load(Ordering::Relaxed)
+            .max(self.discard_before.load(Ordering::Acquire));
         (write - read) as usize
     }
 
@@ -122,7 +131,10 @@ impl AudioBuffer {
         }
 
         let write = self.write_ptr.load(Ordering::Relaxed);
-        let read = self.read_ptr.load(Ordering::Acquire);
+        let read = self
+            .read_ptr
+            .load(Ordering::Acquire)
+            .max(self.discard_before.load(Ordering::Acquire));
         let available = (write - read) as usize;
         let free = cap - available;
         let to_write = samples.len().min(free);
