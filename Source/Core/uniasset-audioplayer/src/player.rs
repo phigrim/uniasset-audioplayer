@@ -145,6 +145,14 @@ impl AudioPlayer {
         self.mixer.stream_count()
     }
 
+    /// Current device-change epoch (see [`Mixer::device_change_epoch`]).
+    ///
+    /// Poll from the host thread and auto-pause gameplay when the value
+    /// changes (Unity `AudioSettings.OnAudioConfigurationChanged` parity).
+    pub fn device_change_epoch(&self) -> u64 {
+        self.mixer.device_change_epoch()
+    }
+
     /// Pause playback (device-level, not per-stream).
     ///
     /// The audio callback will no longer be invoked. Use [`resume`](Self::resume)

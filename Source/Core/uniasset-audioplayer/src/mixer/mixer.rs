@@ -84,6 +84,12 @@ pub struct Mixer {
     /// Wrapped in `UnsafeCell` — only the audio thread accesses this.
     /// Pre-allocated capacity removes allocation from the hot path.
     scratch: UnsafeCell<ScratchBuf>,
+
+    /// Device-change epoch (§ unity parity): bumped whenever the underlying
+    /// audio endpoint is invalidated, reformatted or recovered (e.g. speaker →
+    /// Bluetooth switch). Hosts poll this to auto-pause gameplay like Unity's
+    /// `AudioSettings.OnAudioConfigurationChanged`.
+    device_change_epoch: AtomicU64,
 }
 
 // Safety: Mixer requires Send + Sync for AudioManager.
@@ -119,7 +125,18 @@ impl Mixer {
                 stream_buf,
                 mix_buf,
             }),
+            device_change_epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Current device-change epoch. Increments on every endpoint invalidation,
+    /// format change or recovery; poll from the host thread to detect switches.
+    pub fn device_change_epoch(&self) -> u64 {
+        self.device_change_epoch.load(Ordering::Acquire)
+    }
+
+    fn bump_device_change_epoch(&self) {
+        self.device_change_epoch.fetch_add(1, Ordering::Release);
     }
 
     /// Return the target audio format.
@@ -369,8 +386,23 @@ impl AudioManager for Mixer {
         frame_count
     }
 
+    fn on_device_invalidated(&self) {
+        // Endpoint lost (e.g. Bluetooth headset disconnected): notify hosts so
+        // they can auto-pause gameplay while the endpoint is being rebuilt.
+        self.bump_device_change_epoch();
+    }
+
     fn on_device_format_changed(&self, format: AudioFormat) {
         self.reconfigure_format(format);
+        // Device switch typically comes with a format change (speaker → BT
+        // headset); count it as a device change for auto-pause hosts.
+        self.bump_device_change_epoch();
+    }
+
+    fn on_device_recovered(&self) {
+        // Replacement endpoint is up again; bump so hosts that pause on
+        // invalidation can resume their polling state.
+        self.bump_device_change_epoch();
     }
 }
 
