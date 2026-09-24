@@ -25,6 +25,18 @@ use crate::error::AudioError;
 use crate::hal::{AudioDevice, AudioManager};
 use crate::types::AudioFormat;
 
+// ohos-audio-sys 0.1 binds the OHAudio enums with their type name as prefix,
+// and all result/enum payloads are `u32`.
+const AUDIOSTREAM_SUCCESS: u32 = OH_AudioStream_Result_AUDIOSTREAM_SUCCESS;
+// The write-data callback is a plain `int` in the OHAudio C contract, unlike
+// the u32 result codes used by the builder functions.
+const WRITE_CALLBACK_SUCCESS: i32 = 0;
+const AUDIOSTREAM_USAGE_MUSIC: u32 = OH_AudioStream_Usage_AUDIOSTREAM_USAGE_MUSIC;
+const AUDIOSTREAM_LATENCY_MODE_FAST: u32 = OH_AudioStream_LatencyMode_AUDIOSTREAM_LATENCY_MODE_FAST;
+const AUDIOSTREAM_SAMPLE_F32LE: u32 = OH_AudioStream_SampleFormat_AUDIOSTREAM_SAMPLE_F32LE;
+const AUDIOSTREAM_ENCODING_TYPE_RAW: u32 = OH_AudioStream_EncodingType_AUDIOSTREAM_ENCODING_TYPE_RAW;
+const AUDIOSTREAM_TYPE_RENDERER: u32 = OH_AudioStream_Type_AUDIOSTREAM_TYPE_RENDERER;
+
 /// Default sample rate fallback: 48 kHz.
 const DEFAULT_SAMPLE_RATE: u32 = 48000;
 
@@ -85,7 +97,7 @@ extern "C" fn write_data_callback<M: AudioManager>(
 ) -> i32 {
     // Null / invalid-argument guards.
     if user_data.is_null() || buffer.is_null() || buffer_len <= 0 {
-        return AUDIOSTREAM_SUCCESS;
+        return WRITE_CALLBACK_SUCCESS;
     }
 
     let cb_ref: &CallbackRef<M> = unsafe { &*(user_data as *const CallbackRef<M>) };
@@ -93,11 +105,11 @@ extern "C" fn write_data_callback<M: AudioManager>(
 
     let sample_count = (buffer_len as usize) / 4;
     if sample_count == 0 {
-        return AUDIOSTREAM_SUCCESS;
+        return WRITE_CALLBACK_SUCCESS;
     }
     let frame_count = sample_count / channel_count;
     if frame_count == 0 {
-        return AUDIOSTREAM_SUCCESS;
+        return WRITE_CALLBACK_SUCCESS;
     }
 
     // Safety: buffer_len bytes of writable memory provided by OHOS.
@@ -107,7 +119,7 @@ extern "C" fn write_data_callback<M: AudioManager>(
     let manager_ptr = cb_ref.get();
     if manager_ptr.is_null() {
         output.fill(0.0);
-        return AUDIOSTREAM_SUCCESS;
+        return WRITE_CALLBACK_SUCCESS;
     }
 
     // Wrap the callback call in catch_unwind so a panic in user code
@@ -138,7 +150,7 @@ extern "C" fn write_data_callback<M: AudioManager>(
         }
     }
 
-    AUDIOSTREAM_SUCCESS
+    WRITE_CALLBACK_SUCCESS
 }
 
 // ── OhosDevice ──────────────────────────────────────────────────────────
@@ -159,7 +171,7 @@ pub struct OhosDevice<M: AudioManager> {
     /// Hardware format detected at open time.
     format: AudioFormat,
     /// The OH_AudioRenderer handle (audio stream).
-    renderer: Option<OH_AudioRenderer>,
+    renderer: Option<*mut OH_AudioRenderer>,
     /// Indirection for the callback pointer. Created in `new()`, passed as
     /// OHOS userData, and the real pointer is set in `start()`.
     _callback_ref: Option<Box<CallbackRef<M>>>,
@@ -186,12 +198,14 @@ impl<M: AudioManager> OhosDevice<M> {
 
         // Create the callback indirection (with null ptr) that will be
         // registered as the OHOS userData. The real pointer is set in start().
-        let cb_ref = Box::new(CallbackRef::new(channel_count));
+        let cb_ref = Box::new(CallbackRef::<M>::new(channel_count));
         let user_data = Box::into_raw(cb_ref) as *mut c_void;
 
-        // Create the stream builder.
-        let mut builder: OH_AudioStreamBuilder = std::ptr::null_mut();
-        let ret = unsafe { OH_AudioStreamBuilder_Create(&mut builder) };
+        // Create the stream builder (renderer stream type).
+        let mut builder: *mut OH_AudioStreamBuilder = std::ptr::null_mut();
+        let ret = unsafe {
+            OH_AudioStreamBuilder_Create(&mut builder, AUDIOSTREAM_TYPE_RENDERER)
+        };
         if ret != AUDIOSTREAM_SUCCESS || builder.is_null() {
             unsafe {
                 drop(Box::from_raw(user_data as *mut CallbackRef<M>));
@@ -249,7 +263,7 @@ impl<M: AudioManager> OhosDevice<M> {
         }
 
         let ret = unsafe {
-            OH_AudioStreamBuilder_SetSampleFormat(builder, AUDIOSTREAM_SAMPLE_FORMAT_F32LE)
+            OH_AudioStreamBuilder_SetSampleFormat(builder, AUDIOSTREAM_SAMPLE_F32LE)
         };
         if ret != AUDIOSTREAM_SUCCESS {
             unsafe {
@@ -293,7 +307,7 @@ impl<M: AudioManager> OhosDevice<M> {
         }
 
         // Generate the renderer from the builder.
-        let mut renderer: OH_AudioRenderer = std::ptr::null_mut();
+        let mut renderer: *mut OH_AudioRenderer = std::ptr::null_mut();
         let ret = unsafe { OH_AudioStreamBuilder_GenerateRenderer(builder, &mut renderer) };
         // Builder is consumed; always destroy it.
         unsafe {
@@ -307,7 +321,9 @@ impl<M: AudioManager> OhosDevice<M> {
         }
 
         // Reconstruct the CallbackRef Box from its raw pointer so we own it.
-        let cb_ref = unsafe { Box::from_raw(user_data as *mut CallbackRef<M>) };
+        // Mutating `channel_count` here is safe: the renderer has not been
+        // started, so no audio-thread callback can observe the write.
+        let mut cb_ref = unsafe { Box::from_raw(user_data as *mut CallbackRef<M>) };
 
         // Query the actual hardware format from the renderer.
         // Fall back to defaults if the query fails.

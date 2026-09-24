@@ -18,9 +18,9 @@ mod oboe;
 #[cfg(target_os = "android")]
 pub use oboe::OboeDevice;
 
-#[cfg(target_os = "ohos")]
+#[cfg(target_env = "ohos")]
 mod ohos;
-#[cfg(target_os = "ohos")]
+#[cfg(target_env = "ohos")]
 pub use ohos::OhosDevice;
 
 #[cfg(not(any(
@@ -28,7 +28,7 @@ pub use ohos::OhosDevice;
     target_os = "ios",
     target_os = "windows",
     target_os = "android",
-    target_os = "ohos"
+    target_env = "ohos"
 )))]
 mod dummy;
 #[cfg(not(any(
@@ -36,7 +36,7 @@ mod dummy;
     target_os = "ios",
     target_os = "windows",
     target_os = "android",
-    target_os = "ohos"
+    target_env = "ohos"
 )))]
 pub use dummy::DummyDevice;
 
@@ -49,14 +49,14 @@ pub enum PlatformAudioDevice<M: AudioManager> {
     Wasapi(WasapiDevice<M>),
     #[cfg(target_os = "android")]
     Oboe(OboeDevice<M>),
-    #[cfg(target_os = "ohos")]
+    #[cfg(target_env = "ohos")]
     Ohos(OhosDevice<M>),
     #[cfg(not(any(
         target_os = "macos",
         target_os = "ios",
         target_os = "windows",
         target_os = "android",
-        target_os = "ohos"
+        target_env = "ohos"
     )))]
     Dummy(DummyDevice<M>),
 }
@@ -70,14 +70,14 @@ impl<M: AudioManager> AudioDevice for PlatformAudioDevice<M> {
             Self::Wasapi(device) => device.format(),
             #[cfg(target_os = "android")]
             Self::Oboe(device) => device.format(),
-            #[cfg(target_os = "ohos")]
+            #[cfg(target_env = "ohos")]
             Self::Ohos(device) => device.format(),
             #[cfg(not(any(
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "windows",
                 target_os = "android",
-                target_os = "ohos"
+                target_env = "ohos"
             )))]
             Self::Dummy(device) => device.format(),
         }
@@ -91,14 +91,14 @@ impl<M: AudioManager> AudioDevice for PlatformAudioDevice<M> {
             Self::Wasapi(device) => device.start(),
             #[cfg(target_os = "android")]
             Self::Oboe(device) => device.start(),
-            #[cfg(target_os = "ohos")]
+            #[cfg(target_env = "ohos")]
             Self::Ohos(device) => device.start(),
             #[cfg(not(any(
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "windows",
                 target_os = "android",
-                target_os = "ohos"
+                target_env = "ohos"
             )))]
             Self::Dummy(device) => device.start(),
         }
@@ -112,14 +112,14 @@ impl<M: AudioManager> AudioDevice for PlatformAudioDevice<M> {
             Self::Wasapi(device) => device.stop(),
             #[cfg(target_os = "android")]
             Self::Oboe(device) => device.stop(),
-            #[cfg(target_os = "ohos")]
+            #[cfg(target_env = "ohos")]
             Self::Ohos(device) => device.stop(),
             #[cfg(not(any(
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "windows",
                 target_os = "android",
-                target_os = "ohos"
+                target_env = "ohos"
             )))]
             Self::Dummy(device) => device.stop(),
         }
@@ -133,14 +133,14 @@ impl<M: AudioManager> AudioDevice for PlatformAudioDevice<M> {
             Self::Wasapi(device) => device.pause(),
             #[cfg(target_os = "android")]
             Self::Oboe(device) => device.pause(),
-            #[cfg(target_os = "ohos")]
+            #[cfg(target_env = "ohos")]
             Self::Ohos(device) => device.pause(),
             #[cfg(not(any(
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "windows",
                 target_os = "android",
-                target_os = "ohos"
+                target_env = "ohos"
             )))]
             Self::Dummy(device) => device.pause(),
         }
@@ -154,14 +154,14 @@ impl<M: AudioManager> AudioDevice for PlatformAudioDevice<M> {
             Self::Wasapi(device) => device.resume(),
             #[cfg(target_os = "android")]
             Self::Oboe(device) => device.resume(),
-            #[cfg(target_os = "ohos")]
+            #[cfg(target_env = "ohos")]
             Self::Ohos(device) => device.resume(),
             #[cfg(not(any(
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "windows",
                 target_os = "android",
-                target_os = "ohos"
+                target_env = "ohos"
             )))]
             Self::Dummy(device) => device.resume(),
         }
@@ -187,7 +187,7 @@ impl<M: AudioManager> PlatformAudioDevice<M> {
             return OboeDevice::new(manager).map(PlatformAudioDevice::Oboe);
         }
 
-        #[cfg(target_os = "ohos")]
+        #[cfg(target_env = "ohos")]
         {
             return OhosDevice::new(manager).map(PlatformAudioDevice::Ohos);
         }
@@ -197,7 +197,7 @@ impl<M: AudioManager> PlatformAudioDevice<M> {
             target_os = "ios",
             target_os = "windows",
             target_os = "android",
-            target_os = "ohos"
+            target_env = "ohos"
         )))]
         {
             return Ok(PlatformAudioDevice::Dummy(DummyDevice::new(manager)));

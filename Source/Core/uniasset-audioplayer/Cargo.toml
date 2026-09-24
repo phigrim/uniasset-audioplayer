@@ -45,10 +45,11 @@ windows-core = "0.61"
 [target.'cfg(target_os = "android")'.dependencies]
 oboe = "0.6"
 
-[target.'cfg(target_os = "ohos")'.dependencies]
-ohos-audio-sys = "0.1"
+[target.'cfg(target_env = "ohos")'.dependencies]
+# api-17 gates AUDIOSTREAM_SAMPLE_F32LE, which the renderer requests.
+ohos-audio-sys = { version = "0.1", features = ["api-17"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(target_os, values("ohos"))',
+    'cfg(target_env, values("ohos"))',
 ] }
